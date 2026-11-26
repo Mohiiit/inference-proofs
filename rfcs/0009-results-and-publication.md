@@ -74,7 +74,7 @@ Top-level structure of `run.json` (`run/1`):
 - `system_kind` mirrors `kind` from `system.yaml`: `prover`, `reference` ([RFC-0015](0015-reference-rows.md)), or `test` (the fake CI systems). Reference systems skip `commit` and `verify` (recompute jobs time their execution inside `prove`), so their `raw` object omits `commit` and `verify`. Runs with `system_kind: test` never enter a release.
 - `events` stores the ordered lifecycle timestamps `{event, mono_ns}` used to derive all timing scopes ([RFC-0010](0010-harness-runner.md), [RFC-0011](0011-measurement-and-sampling.md)); `mono_ns` integers are allowlisted under G5 as structural timestamps, while all published durations are derived quantities.
 - `claim` identifies the active claim card by system, configuration, and `card_version`.
-- `raw` contains measured step-level quantities, `metrics` contains recorded and derived quantities keyed by RFC-0004 metric IDs, and `adapter_phases` contains adapter-reported phase timings (`source.kind: adapter`).
+- `raw` contains measured step-level quantities, `metrics` contains recorded and derived quantities keyed by RFC-0004 metric IDs, and `adapter_phases` contains adapter-reported phase timings by step (`adapter_phases.<step>.<name>`, `source.kind: adapter`, RFC-0004).
 - `replaces` is either `null` or `{run_id, reason}` (§Append-only rule and corrections).
 - `inputs` (included on runs recorded from the 2026-11-08 amendments onward) stores runtime copies of the workload's asserted inputs, `active_parameters_per_token` and `weight_bits` ([RFC-0003 WB-4](0003-workloads.md#weight-bits)), referenced directly by derived quantities that depend on them.
 

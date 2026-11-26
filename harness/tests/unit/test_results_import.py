@@ -20,7 +20,10 @@ def test_second_session_takes_the_next_id_and_cites_results(tmp_path: Path) -> N
     (src / "io" / "proofs" / "p.bin").write_bytes(b"x")
     source = {"ref": f"{JOB}/run.json#/events", "inputs": [f"{JOB}/run.json#/proofs", "derive:x"]}
     metric = {"value": 1.0, "source": source}
-    write_json(src / "run.json", {"run_id": OLD, "system": "sash", "metrics": {"m": metric}})
+    phase = {"value": 2.0, "source": {"kind": "adapter", "ref": f"{JOB}/run.json#/adapter_phases"
+                                      "/commit/witness"}}  # fmt: skip
+    write_json(src / "run.json", {"run_id": OLD, "system": "sash", "metrics": {"m": metric},
+                                  "adapter_phases": {"commit": {"witness": phase}}})  # fmt: skip
     write_json(src / "verify-trace" / "req-0.json", {"run_id": OLD, "proof_id": "req-0"})
     (src / "digests.txt").write_text("logs/harness.jsonl\tsha256:00\n")
     results = tmp_path / "results"
@@ -36,6 +39,8 @@ def test_second_session_takes_the_next_id_and_cites_results(tmp_path: Path) -> N
     src_block = run["metrics"]["m"]["source"]
     assert src_block["ref"] == f"results/v1.0/sash/{new}/run.json#/events"
     assert src_block["inputs"] == [f"results/v1.0/sash/{new}/run.json#/proofs", "derive:x"]
+    phase_ref = run["adapter_phases"]["commit"]["witness"]["source"]["ref"]
+    assert phase_ref == f"results/v1.0/sash/{new}/run.json#/adapter_phases/commit/witness"
     assert json.loads((target / "verify-trace" / "req-0.json").read_text())["run_id"] == new
 
 

@@ -1,16 +1,44 @@
 {
   "adapter_phases": {
-    "witness": {
-      "grade": "measured",
-      "null_reason": null,
-      "scope": "primitive",
-      "source": {
-        "kind": "adapter",
-        "ref": "results/v0.1/fake/2026-11-20-fake-fake-tiny-ci-ci-cpu-1/run.json#/adapter_phases/witness"
+    "commit": {
+      "witness": {
+        "grade": "measured",
+        "null_reason": null,
+        "scope": "primitive",
+        "source": {
+          "kind": "adapter",
+          "ref": "results/v0.1/fake/2026-11-20-fake-fake-tiny-ci-ci-cpu-1/run.json#/adapter_phases/commit/witness"
+        },
+        "tier": "reported",
+        "unit": "s",
+        "value": 0.2
+      }
+    },
+    "prove": {
+      "prove": {
+        "grade": "measured",
+        "null_reason": null,
+        "scope": "primitive",
+        "source": {
+          "kind": "adapter",
+          "ref": "results/v0.1/fake/2026-11-20-fake-fake-tiny-ci-ci-cpu-1/run.json#/adapter_phases/prove/prove"
+        },
+        "tier": "reported",
+        "unit": "s",
+        "value": 0.4
       },
-      "tier": "reported",
-      "unit": "s",
-      "value": 0.2
+      "witness": {
+        "grade": "measured",
+        "null_reason": null,
+        "scope": "primitive",
+        "source": {
+          "kind": "adapter",
+          "ref": "results/v0.1/fake/2026-11-20-fake-fake-tiny-ci-ci-cpu-1/run.json#/adapter_phases/prove/witness"
+        },
+        "tier": "reported",
+        "unit": "s",
+        "value": 0.1
+      }
     }
   },
   "claim": {

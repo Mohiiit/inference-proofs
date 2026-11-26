@@ -144,7 +144,7 @@ Keys stored under `run.json` `metrics` for each repetition. Unless noted otherwi
 | `<step>_host_memory_peak_anon` | B | null | Peak sampled `memory.stat` `anon` for step in `commit`, `prove` |
 | `<step>_cpu_seconds` | s | `commit` or `prove.session` | Difference in cgroup `cpu.stat` `usage_usec` over the step |
 | `verdicts_accept_count` | count | null | Number of honest proofs accepted |
-| `adapter_phases.<name>` | s | `primitive` | Adapter-reported internal timing (`source.kind: adapter`; subject to INV-GRADE-2) |
+| `adapter_phases.<step>.<name>` | s | `primitive` | Adapter-reported internal timing of `commit` or `prove`, one entry per phase name the step's output reports, a name reported twice summed (`source.kind: adapter`; subject to INV-GRADE-2) |
 
 A "Statistic over proofs" stores the mean in `value` and records `n`, `mean`, `stdev`, `min`, and `max` across all proofs within that repetition inside `stats` (`n_failed` is always 0 here under INV-TOK-2).
 

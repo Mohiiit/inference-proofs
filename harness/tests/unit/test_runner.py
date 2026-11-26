@@ -294,3 +294,95 @@ def test_closed_workload_reads_the_card_a_job_records(tmp_path: Path, name: str,
         check_card_class(tmp_path, REGISTRY, sash, wl)
     assert err.value.kind == ErrorKind.CONFIG
     assert "systems/sash/claims/default.yaml or systems/sash/claim.yaml" in str(err.value)
+
+
+class WithPhases:
+    """The fake, its commit and prove outputs carrying the phases an adapter reports."""
+
+    def __init__(self, fail: str | None = None) -> None:
+        self.inner: ContainerRunner = (
+            FailAt(fail) if fail else InProcessRunner(FAKE / "entrypoint", REGISTRY, env=UPSTREAM)
+        )
+        self.phases = {
+            "commit": [("witness", 0.25), ("model_roots", 0.5), ("kernels_build", 0.0)],
+            "prove": [("witness", 0.125), ("prove", 1.5), ("witness", 0.375)],  # two replies
+        }
+
+    def run(self, image: str, subcommand: str, io_dir: Path, **kw: object) -> StepResult:
+        result = self.inner.run(image, subcommand, io_dir, **kw)  # type: ignore[arg-type]
+        if subcommand not in self.phases or result.out is None:
+            return result
+        doc = json.loads((io_dir / "out.json").read_text())
+        doc["phases"] = [{"name": n, "seconds": s} for n, s in self.phases[subcommand]]
+        (io_dir / "out.json").write_text(json.dumps(doc))
+        out = load(io_dir / "out.json", REGISTRY)
+        return dataclasses.replace(result, out=out)  # type: ignore[arg-type]
+
+
+def test_adapter_phases_recorded_per_step(tmp_path: Path) -> None:
+    """RFC-0004 `adapter_phases.<step>.<name>`: each phase's seconds, a name reported twice
+    summed, labelled adapter-reported; no metric reads them (INV-GRADE-2)."""
+    run_dir = runner(WithPhases()).run(spec(tmp_path))
+    doc = read(run_dir)
+    assert doc["status"] == "completed"
+    assert REGISTRY.errors("run/1", doc) == []
+    phases = doc["adapter_phases"]
+    assert isinstance(phases, dict)
+    values = {s: {n: q["value"] for n, q in p.items()} for s, p in phases.items()}
+    assert values == {
+        "commit": {"witness": 0.25, "model_roots": 0.5, "kernels_build": 0.0},
+        "prove": {"witness": 0.5, "prove": 1.5},
+    }
+    witness = phases["prove"]["witness"]
+    assert (witness["unit"], witness["scope"], witness["grade"], witness["tier"]) == (
+        "s", "primitive", "measured", "reported"
+    )  # fmt: skip
+    assert witness["source"]["kind"] == "adapter"
+    assert witness["source"]["ref"].endswith(
+        f"{run_dir.name}/run.json#/adapter_phases/prove/witness"
+    )
+    metrics, plain = doc["metrics"], read(runner().run(spec(tmp_path / "plain")))["metrics"]
+    assert isinstance(metrics, dict)
+    assert isinstance(plain, dict)
+    assert metrics.keys() == plain.keys()
+    assert all(q["source"]["kind"] != "adapter" for q in metrics.values())
+    assert check_derived(run_dir / "run.json", ROOT) == []
+
+
+def test_failed_prove_keeps_the_commit_phases(tmp_path: Path) -> None:
+    doc = read(runner(WithPhases(fail="prove")).run(spec(tmp_path)))
+    assert doc["status"] == "failed"
+    assert REGISTRY.errors("run/1", doc) == []
+    phases = doc["adapter_phases"]
+    assert isinstance(phases, dict)
+    assert list(phases) == ["commit"]
+    assert phases["commit"]["model_roots"]["value"] == 0.5
+
+
+def test_no_phases_reported_records_none(tmp_path: Path) -> None:
+    assert read(runner().run(spec(tmp_path)))["adapter_phases"] == {}
+
+
+class SymlinkProverFile(WithPhases):
+    """WithPhases, its commit naming a prover file that is a symlink, which the harness
+    refuses to take (RFC-0014)."""
+
+    def run(self, image: str, subcommand: str, io_dir: Path, **kw: object) -> StepResult:
+        result = super().run(image, subcommand, io_dir, **kw)
+        if subcommand != "commit" or result.out is None:
+            return result
+        (io_dir / "state" / "real").write_text("x")
+        (io_dir / "state" / "link").symlink_to(io_dir / "state" / "real")
+        doc = json.loads((io_dir / "out.json").read_text())
+        doc["prover_files"] = ["/io/state/link"]
+        (io_dir / "out.json").write_text(json.dumps(doc))
+        return dataclasses.replace(result, out=load(io_dir / "out.json", REGISTRY))  # type: ignore[arg-type]
+
+
+def test_a_refused_commit_records_no_phases(tmp_path: Path) -> None:
+    doc = read(runner(SymlinkProverFile()).run(spec(tmp_path)))
+    assert doc["status"] == "failed"
+    failure = doc["failure"]
+    assert isinstance(failure, dict)
+    assert failure["kind"] == "adapter"
+    assert doc["adapter_phases"] == {}

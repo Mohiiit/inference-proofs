@@ -487,7 +487,7 @@ PROVIDER_ENV = re.compile(r"^(VAST_|CONTAINER_|PUBLIC_|SSH_|JUPYTER|OPEN_BUTTON|
                           r"|HF_NETWORK_GROUP_)"
                           r"|^(HOSTNAME|GPU_COUNT|NV_GPU|JOB_ID|ACCELERATOR|CPU_CORES|MEMORY)$"
                           r"|^IPROOFS_(COMMIT|UPLOAD|UPLOAD_DIR|LABEL|JOB_BUDGET_S|GPU|GPUS|PROFILE"
-                          r"|DEV_IMAGE)$"
+                          r"|DEV_IMAGE|IMAGE)$"
                           r"|KEY|TOKEN|SECRET|PASSW")  # fmt: skip
 
 

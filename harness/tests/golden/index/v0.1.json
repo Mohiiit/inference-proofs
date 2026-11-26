@@ -1039,7 +1039,7 @@
       }
     }
   },
-  "inputs_digest": "sha256:5a1c244e9fa581578f84f0483063e70d81c997f25bb47b45f3ac3e6bac278dcf",
+  "inputs_digest": "sha256:6d264e33cf15e287db754f73a9f11fc85d58a654a28edb7d0b07107b34d4a1b5",
   "reference": {
     "digest": "sha256:5a6639f10a7db4536d7ef2d3eeca2cc6356302f0eb0ba02d2ea38ba450bed3f9",
     "file": "reference/v0.1.yaml"

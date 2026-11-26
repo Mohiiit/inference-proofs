@@ -7,6 +7,7 @@ reaches `written`; a failed job is written with its failure record, never droppe
 
 import errno
 import json
+import math
 import os
 import re
 import shutil
@@ -1339,17 +1340,16 @@ class Runner:
 
     def _commit(self, job: Job, control: Mapping[str, object] | None = None) -> None:
         """RFC-0014 §The commitment record: copy the commit step's files into a store no
-        later container mounts read-write, and record their digests."""
-        job.commit, _ = self._call(
-            job, "commit", {"model_dir": "/models"}, control=control or False
-        )
+        later container mounts read-write, and record their digests. The output becomes
+        `job.commit` only once its files are taken."""
+        out, _ = self._call(job, "commit", {"model_dir": "/models"}, control=control or False)
         io = IoDirs(job.staging / "io")
-        records: dict[str, object] = {"commitment_id": job.commit.commitment_id}
+        records: dict[str, object] = {"commitment_id": out.commitment_id}
         for kind, side in STORE_SIDES.items():
             store = job.staging / COMMITMENT_STORE / side
             store.mkdir(parents=True)
             copies = []
-            for container_path in getattr(job.commit, kind) or ():
+            for container_path in getattr(out, kind) or ():
                 src = io.host(container_path, "commit")
                 dst = store / src.name
                 if src.is_symlink() or not src.is_file() or dst.exists():
@@ -1361,7 +1361,7 @@ class Runner:
                 shutil.copyfile(src, dst)
                 copies.append(dst)
             records[kind] = file_records(copies)
-        job.commitment_record = records
+        job.commit, job.commitment_record = out, records
         io_dir = job.staging / "io"
         state = io_dir / "state"
         names = sorted(p.name for p in state.iterdir()) if state.is_dir() else []
@@ -2215,7 +2215,7 @@ class Runner:
         manifest = self._manifest(job) if resolved else None
         # run.json names the card the manifest records (RFC-0016 OVR-5 reads it)
         claim = manifest.get("claim") if manifest is not None else None
-        doc = self._run_doc(job, metrics, claim)
+        doc = self._run_doc(job, metrics, claim, self._adapter_phases(job, run_json))
         if self.load == "ladder":  # the replies go beside run.json (iproofs.replies, SIZE-1)
             doc = split_replies(job.staging, doc)
         invalid = {"run.json": (doc, self.registry.errors("run/1", doc))}
@@ -2230,7 +2230,7 @@ class Runner:
             message = "; ".join(f"{n} fails its schema: {e[0]}" for n, e in sorted(bad.items()))
             job.failure = Failure.build(ErrorKind.INTERNAL, "written", message)
             manifest = None if "manifest.json" in bad else manifest
-            doc = self._run_doc(job, {}, claim if manifest is not None else None)
+            doc = self._run_doc(job, {}, claim if manifest is not None else None)  # no phases
         write_json(job.staging / "run.json", doc)
         if manifest is not None:
             write_json(job.staging / "manifest.json", manifest)
@@ -2359,8 +2359,44 @@ class Runner:
             out["agreement"] = job.agreement[proof_id]
         return out
 
+    def _adapter_phases(self, job: Job, run_json: str) -> dict[str, dict[str, QuantityTree]]:
+        """RFC-0004 `adapter_phases.<step>.<name>`: the seconds the accepted commit and prove
+        outputs report for each phase, labelled adapter-reported (INV-GRADE-2: no formula reads
+        them). Names come from the adapter, none is expected here. A name a step reports more
+        than once holds the sum of its entries (an adapter that times each reply apart). Kept on
+        a failed run for the steps whose output the harness accepted; a control run records
+        none (POL-2)."""
+        if self.control_run:
+            return {}
+        phases: dict[str, dict[str, QuantityTree]] = {}
+        for step, out in (("commit", job.commit), ("prove", job.proofs)):
+            seconds: dict[str, list[float]] = {}
+            for phase in out.phases if out is not None else ():
+                seconds.setdefault(phase.name, []).append(phase.seconds)
+            if seconds:
+                phases[step] = {
+                    name: {
+                        "value": math.fsum(values),
+                        "unit": str(Unit.S),
+                        "scope": str(Scope.PRIMITIVE),
+                        "grade": str(Grade.MEASURED),
+                        "tier": str(Tier.REPORTED),
+                        "source": {
+                            "kind": str(SourceKind.ADAPTER),
+                            "ref": f"{run_json}#/adapter_phases/{step}/{name}",
+                        },
+                        "null_reason": None,
+                    }
+                    for name, values in seconds.items()
+                }
+        return phases
+
     def _run_doc(
-        self, job: Job, metrics: dict[str, QuantityTree], claim: object = None
+        self,
+        job: Job,
+        metrics: dict[str, QuantityTree],
+        claim: object = None,
+        phases: Mapping[str, Mapping[str, QuantityTree]] | None = None,
     ) -> dict[str, object]:
         spec = job.spec
         tokens = self._tokens(job) if metrics else [(0, 0)] * len(job.releases)
@@ -2380,7 +2416,7 @@ class Runner:
                 "failure": job.failure.to_json() if job.failure else None,
                 "replaces": None,
                 "raw": {},
-                "adapter_phases": {},
+                "adapter_phases": {k: dict(v) for k, v in (phases or {}).items()},
                 "metrics": metrics,
                 "events": job.events.events,
                 "proofs": [

@@ -201,7 +201,7 @@ The expected format of `source.ref` depends on `source.kind`:
 | `kind` | `ref` form | Example |
 |---|---|---|
 | `harness` | Repo-relative path plus JSON Pointer to the raw measurement | `results/v0.1/fake/2026-11-20-fake-fake-tiny-ci-ci-cpu-1/run.json#/raw/prove/wall_ns` |
-| `adapter` | Repo-relative path plus JSON Pointer to the stored `out.json` phase entry | `.../run.json#/adapter_phases/witness` |
+| `adapter` | Repo-relative path plus JSON Pointer to the phase's own entry in `run.json`; the adapter's `out.json` is not kept, so the value is as the accepted output reported it (INV-GRADE-2) | `.../run.json#/adapter_phases/commit/witness` |
 | `derivation` | Formula id from RFC-0004 as `derive:<id>@<harness version>`; `inputs` lists a repo-relative path plus JSON Pointer for each input quantity in argument order | `derive:D-RATE-S@0.1.0` |
 | `upstream` | URL containing a full 40-hex commit hash or an immutable archive URL | `https://github.com/sg-ai-safety-hub/zk-inference-results/blob/11decec3c0b62c707618aab5deb82750b355d202/constants.json` |
 | `reference_file` | Repo-relative path plus JSON Pointer into parsed YAML (either a reference file or the workload record from which a `run.json` `inputs` quantity was copied, RFC-0003 WB-4) | `reference/v0.1.yaml#/cost/price_per_gpu_hour_usd`, `workloads/sash-l31-8b-c1024.yaml#/precision/weight_bits` |
@@ -403,6 +403,8 @@ Amendment of 2026-11-16 (RFC-0018 MC-4a, GL-5, SI-3, Q42, Q43). Additive, with t
 Amendment of 2026-11-17 (RFC-0018 Q44, GL-5, GL-11, SI-3). Additive, with the stored board recomputed in the same commit (RFC-0018 Q14):
 - `board/1`: adds optional per-petal `to_met`, `sources`, `sources_count`, `read_facts` (each carrying `used`), `why`, and structured page facts (`bound`, `hiding`, `fidelity`, `trust`), plus optional `limits`, `said`, and `build.axioms` inside `formal`.
 - `properties/2`: adds optional `plain`, `named`, `described`, and `check` on individual facts, plus optional `bound.after` (verified offline against its quote) and `formal.limits`.
+
+Amendment of 2026-11-26 (RFC-0004 `adapter_phases.<step>.<name>`): `run/1` `adapter_phases` is keyed by step (`commit`, `prove`), then by the phase name the adapter reports, each an adapter-reported quantity in `s` at scope `primitive`. The runner had written the field empty since it was introduced, so every stored run holds `{}`, which stays valid; no stored record, board or page changes.
 
 ## Testing Strategy
 

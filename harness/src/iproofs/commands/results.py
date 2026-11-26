@@ -10,9 +10,9 @@ it, and:
   `commitment/`, `controls-io/`, `logprobs-io/`, `.archive/`), as the earlier imports did;
 - writes the new id wherever the old one appears in the copied text files (run.json,
   manifest.json, verify-trace/, verifier/, logs/), so the records name the directory they are in;
-- moves run.json's metric citations (`source.ref`, `source.inputs`) from the job's results root
-  (`/tmp/iproofs/out/dev-results/`) to `results/`. Values are unchanged; gate G4 recomputes each
-  derived one from them. Command lines and verify traces keep the job's paths.
+- moves run.json's metric and adapter-phase citations (`source.ref`, `source.inputs`) from the
+  job's results root (`/tmp/iproofs/out/dev-results/`) to `results/`. Values are unchanged; gate
+  G4 recomputes each derived one from them. Command lines and verify traces keep the job's paths.
 
 digests.txt is copied as written: it names no run id, and its log digests are of the streams
 before redaction, not of the files.
@@ -66,13 +66,17 @@ def next_run_id(parent: Path, run_id: str) -> str:
 
 
 def relocate(doc: dict[str, object]) -> int:
-    """Move run.json's metric citations from the job's results root to results/."""
+    """Move run.json's metric and adapter-phase citations from the job's results root to
+    results/."""
     moved = 0
     metrics = doc.get("metrics")
     entries: list[object] = (
         list(metrics.values()) if isinstance(metrics, dict)
         else list(metrics) if isinstance(metrics, list) else []
     )  # fmt: skip
+    phases = doc.get("adapter_phases")
+    for step in phases.values() if isinstance(phases, dict) else ():
+        entries += list(step.values()) if isinstance(step, dict) else []
     for m in entries:
         src = m.get("source") if isinstance(m, dict) else None
         if not isinstance(src, dict):
