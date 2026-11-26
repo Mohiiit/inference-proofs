@@ -12,11 +12,13 @@ each argument to its upstream source.
 - `commit` extracts a commitment sequence from upstream's own corpus, writes its plan and runs
   `zk-prover model-roots`: the per-layer model roots and the per-(layer, c) calibration a
   verifier derives shape roots from. It also keeps the attention calibration and the token
-  cache the prover reuses.
+  cache the prover reuses. From that sequence's witness it emits the device kernels into one
+  store, installs them into a copy of the source and builds the CUDA backend once (upstream's
+  documented way to a device build).
 - `prove` decodes the prompt greedily (`gen_ids`), extracts the witnesses, writes the plan,
-  generates and installs the device kernels for the plan's shapes into a copy of the source
-  and rebuilds the CUDA backend (upstream's documented way to a device build), proves the
-  grid with `compose-chunks` on that backend, and releases one directory per sequence.
+  emits the kernels for the plan's shapes into the same store, rebuilds only when that added a
+  kernel, proves the grid with `compose-chunks` on that backend, and releases one directory per
+  sequence.
 - `verify` runs `boundary-grid --verify` on the SIMD backend; its verdict alone is the verdict.
   The claimed output, which the grid does not take, is compared with the ids the proof states
   for the reply block and a difference is recorded as a note, never a verdict (RFC-0018 AD-6).
@@ -31,6 +33,7 @@ this file in process. IPROOFS_SASH_EXEC names a program every upstream process i
 through (tests only: a stub that stands in for the binaries); the logged argv is unchanged.
 """
 
+import contextlib
 import fcntl
 import hashlib
 import importlib.util
@@ -63,6 +66,12 @@ SIMD = "/usr/local/bin/zk-prover-simd"  # the reference backend: emission, model
 SRC, HSRC = "/src", "/src/harness"
 STATE, BUILD = "/io/state", "/io/state/build"
 CUDA = BUILD + "/t-cuda/release/zk-prover"  # rebuilt with the plan's kernels installed
+GEN = BUILD + "/gen"  # the one kernel store every emission adds to (ZK_KERNEL_STORE)
+# the widest pins commit's emission widens to: `q_bits + rem_bits <= 31` for the attention
+# output, "11 + 20 = 31 of 31, which ... admits nothing wider" (U/harness/README.md L146-L150);
+# `q_bits + rem_bits <= 30` for the fold (U/prover/src/gadgets/dequant/mod.rs L203-L211). A
+# value the prover refuses is recorded as a refused lowering and adds nothing.
+AO_REM_CAP, FOLD_REM_CAP = 20, 19
 ZK_OUT = STATE + "/zk-out"  # common.py ZK_OUT: tokens.npz and attn_ranges.json live here
 # headline-c4096.sh: the configuration of upstream's recorded runs, verbatim
 SPEC = "y-delay-vw12"
@@ -234,13 +243,13 @@ def witness_and_plan(g: dict, wit: str, extra: list[str]) -> tuple[str, str, str
     dumps = [f"{wit}/head_B{b}" for b in g["head_blocks"]]  # type: ignore[attr-defined]
     head = run([*UV, "-c", HEAD_PINS_PY, f"{wit}/shapes_head.json", pins, *dumps], cwd=HSRC,
                env=env).stdout.strip().splitlines()[-1]  # fmt: skip
-    plan, emit = f"{wit}/plan.txt", f"{wit}/emit.txt"
+    plan, emit_txt = f"{wit}/plan.txt", f"{wit}/emit.txt"
     run([*UV, "-m", "harness.witness.plan", "--dir", wit, "--blocks", str(nb), "--with-block-0",
          "--layers", f"0-{nl - 1}", "--head", f"{wit}/head", "--head-per-block", "--head-blocks",
          hb, f"--layer-flags={LAYER_FLAGS}", "--l0-flags=", "--l0-dir", wit,
-         f"--head-flags={GKR} {head}", "--out", plan, "--emit-out", emit],
+         f"--head-flags={GKR} {head}", "--out", plan, "--emit-out", emit_txt],
         cwd=HSRC, env=env)  # fmt: skip
-    return plan, emit, pins
+    return plan, emit_txt, pins
 
 
 def write_json(path: str, doc: object) -> None:
@@ -275,58 +284,216 @@ def setup(job: dict) -> dict:
 
 def commit(job: dict) -> dict:
     """model-commitment.sh step 1 over a commitment sequence: upstream's own corpus, extracted
-    the way a sequence run extracts it (no `--ids`: the corpus's first tokens)."""
+    the way a sequence run extracts it (no `--ids`: the corpus's first tokens). Then the kernel
+    store from that sequence's witness and one CUDA build (README.md §Kernels); the commitment
+    covers the verifier files alone, as before."""
     t0 = time.monotonic()
     g = geometry(job["shape"], model_layers())
     wit = STATE + "/commit-witness"
     for d in (ZK_OUT, wit):
         host(d).mkdir(parents=True, exist_ok=True)
-    plan, _, pins = witness_and_plan(g, wit, [])
+    plan, emit_txt, pins = witness_and_plan(g, wit, [])
     t1 = time.monotonic()
+    prover = [ZK_OUT + "/attn_ranges.json", ZK_OUT + "/tokens.npz"]
+    if missing := [f for f in prover if not host(f).is_file()]:  # before model-roots and build
+        raise SystemExit(f"sash: the extraction wrote no {missing}")
     roots, grid = STATE + "/model-roots.json", STATE + "/grid.json"
     run([SIMD, "model-roots", "--plan", plan, "--pins", f"{SHARED} {pins}", "--out", roots],
         out=STATE + "/model-roots.out.json")  # fmt: skip
     write_json(grid, g)
+    t2 = time.monotonic()
+    prepare_kernels(plan, emit_txt, pins)
+    t3 = time.monotonic()
     shutil.rmtree(host(wit))  # tens of GB of activations; the plan and pins are in no file kept
+    t4 = time.monotonic()  # the deletion counts in model_roots, as in v1.0
+    _, build_seconds = ensure_built()
     verifier = [roots, grid]
-    prover = [ZK_OUT + "/attn_ranges.json", ZK_OUT + "/tokens.npz"]
-    if missing := [f for f in prover if not host(f).is_file()]:
-        raise SystemExit(f"sash: the extraction wrote no {missing}")
     size = lambda fs: sum(host(f).stat().st_size for f in fs)  # noqa: E731
+    phases = {"witness": t1 - t0, "model_roots": t2 - t1 + t4 - t3, "kernels_emit": t3 - t2,
+              "kernels_build": build_seconds}  # fmt: skip
+    log("commit: seconds " + ", ".join(f"{k} {v:.1f}" for k, v in phases.items()))
     return {**base("commit"), "commitment_id": commitment_of(verifier),
             "verifier_files": verifier, "prover_files": prover,
             "sizes": {"verifier_bytes": size(verifier), "prover_bytes": size(prover)},
-            "phases": [{"name": "witness", "seconds": t1 - t0},
-                       {"name": "model_roots", "seconds": time.monotonic() - t1}]}  # fmt: skip
+            "phases": [{"name": k, "seconds": v} for k, v in phases.items()]}  # fmt: skip
 
 
-def kernels(plan: str, emit: str, pins: str, flags: list[str]) -> None:
-    """sequence-job.sh step 5 and tools/gate/on-card.sh: emit the kernels for every shape of
-    the plan, install them into a copy of the vendored library, rebuild the CUDA backend and
-    check that the library carries this card's architecture. Skipped when the shapes match the
-    last install, as upstream's `kernels.done` marker does."""
+def log(message: str) -> None:
+    """A line for the step's stderr, which the harness keeps (logs/<step>.stderr)."""
+    print(f"sash: {message}", file=sys.stderr, flush=True)
+
+
+def line_args(line: str) -> tuple[str, ...]:
+    """A plan or emit line as emission arguments: its `--ser-tag` removed (sequence-job.sh)."""
+    args = shlex.split(line)
+    if "--ser-tag" in args:
+        i = args.index("--ser-tag")
+        del args[i : i + 2]
+    return tuple(args)
+
+
+def plan_lines(plan: str) -> list[tuple[str, ...]]:
+    return sorted({line_args(ln) for ln in host(plan).read_text().splitlines()
+                   if ln.strip() and not ln.startswith("#")})  # fmt: skip
+
+
+def emit_lines(plan: str, emit: str) -> list[tuple[str, ...]]:
+    """sequence-job.sh step 5's list: every line of `emit.txt` (plan.py's one line per emit key)
+    and every head line of the plan, since the feed kernels of a head are per block."""
     lines = [ln for ln in host(emit).read_text().splitlines() if ln and not ln.startswith("#")]
-    # every head line too: plan.py lists one per table width, the feed kernels are per block
     head = re.compile(r"--ser-tag [A-Za-z0-9_]*head")
     lines += [ln for ln in host(plan).read_text().splitlines()
               if not ln.startswith("#") and head.search(ln)]  # fmt: skip
-    lines = sorted(set(lines))
-    key = hashlib.sha256(("\n".join(lines) + pins + " ".join(flags)).encode()).hexdigest()
-    marker, gen, src = host(BUILD + "/kernels.done"), BUILD + "/gen", BUILD + "/src"
-    if marker.is_file() and marker.read_text() == key:
-        return
-    host(gen).mkdir(parents=True, exist_ok=True)
-    for line in lines:
-        args = shlex.split(line)
-        if "--ser-tag" in args:
-            i = args.index("--ser-tag")
-            del args[i : i + 2]
+    return sorted({line_args(ln) for ln in lines})
+
+
+def pinned(argv: list[str], flag: str) -> int | None:
+    """The value upstream reads for `flag`: its last occurrence (cli.rs arg_pair)."""
+    at = [i for i, a in enumerate(argv[:-1]) if a == flag]
+    return int(argv[at[-1] + 1]) if at else None
+
+
+def emit(lines: list[tuple[str, ...]], pins: str, flags: list[str],
+         sweep: tuple[str, int] | None = None) -> tuple[int, list[str]]:  # fmt: skip
+    """`cudaemit` and `genemit` over `lines` into the one kernel store, as sequence-job.sh step 5
+    runs them. With `sweep` = (flag, value), each line is emitted with that pin set to `value`
+    where upstream reads it, and only where `value` is above the pin the line is emitted at
+    (the prover admits a pin down to the witness's own; commit widens upward only). Returns the
+    number of runs and one line per refused lowering: a refusal is recorded and never fatal
+    (sequence-job.sh); a shape left without its kernel then panics in the proof."""
+    runs, refused = 0, []
+    for args in lines:
+        argv = [*SHARED.split(), *pins.split(), *flags, *args]
+        if sweep is not None:
+            flag, value = sweep
+            own = pinned(argv, flag)
+            if own is not None and value <= own:
+                continue
+            at = [i for i, a in enumerate(argv[:-1]) if a == flag]
+            if at:
+                argv[at[-1] + 1] = str(value)
+            else:
+                argv += [flag, str(value)]
         for cmd, opts in (("cudaemit", ["--block", "256", "--min-blocks", "2"]),
                           ("genemit", ["--families", KERNEL_FAMILIES])):  # fmt: skip
-            # a refused lowering is recorded, never fatal (sequence-job.sh); a shape left
-            # without its kernel then panics in the proof rather than falling back
-            run([SIMD, cmd, *SHARED.split(), *pins.split(), *flags, *args, *opts, "--out", gen],
-                check=False)  # fmt: skip
+            p = run([SIMD, cmd, *argv, *opts, "--out", GEN], check=False)
+            runs += 1
+            if p.returncode != 0:
+                refused.append(f"{cmd} exited {p.returncode} on `{shlex.join(args)}`"
+                               f"{f' at {sweep[0]} {sweep[1]}' if sweep else ''}: "
+                               f"{last_line(p.stderr)[:300]}")  # fmt: skip
+    return runs, refused
+
+
+def store() -> tuple[int, int, str, str]:
+    """The kernel store: its constraint kernels (`shapes.json`, cudagen.rs emit_cmd), its
+    generation shapes (`gen_shapes.json`, gen_emit_cmd), the build key and the shape set.
+    The build key is sha256 over `<file name>\\t<sha256>` lines in name order. A second
+    emission of stored shapes rewrites every file byte for byte except the two manifests, which
+    also carry the last run's `source` (a witness path), `components` and new-shape count; of
+    those the key takes only the `families` list, which is what the two install scripts read.
+    The files keep shapes in first-seen order, so two sessions holding the same shapes reached
+    in another order have two keys; the shape set, sha256 over the sorted
+    `<list>\\t<family>\\t<sha256 of the shape's Ir>` lines, is the same for both."""
+    root, lines = host(GEN), []
+    for p in sorted(root.iterdir()) if root.is_dir() else []:
+        if not p.is_file():
+            continue
+        body = p.read_bytes()
+        if p.name in ("manifest.json", "gen_manifest.json"):
+            with contextlib.suppress(ValueError, AttributeError):  # else digested as it is
+                body = json.dumps(json.loads(body).get("families"), sort_keys=True).encode()
+        lines.append(f"{p.name}\t{hashlib.sha256(body).hexdigest()}\n")
+
+    def count(name: str) -> int:
+        return len(json.loads((root / name).read_text())) if (root / name).is_file() else 0
+
+    def shape_set() -> str:
+        try:  # each entry is (family, first-seen name, Ir), cudagen.rs L2556
+            keys = sorted(f"{name}\t{family}\t" + hashlib.sha256(
+                json.dumps(ir, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                for name in ("shapes.json", "gen_shapes.json") if (root / name).is_file()
+                for family, _, ir in json.loads((root / name).read_text()))  # fmt: skip
+        except (ValueError, TypeError) as e:  # a log line only, never a stop
+            return f"unreadable ({e})"
+        return "sha256:" + hashlib.sha256("".join(k + "\n" for k in keys).encode()).hexdigest()
+
+    digest = "sha256:" + hashlib.sha256("".join(lines).encode()).hexdigest()
+    return count("shapes.json"), count("gen_shapes.json"), digest, shape_set()
+
+
+def store_line(state: tuple[int, int, str, str]) -> str:
+    return (f"{state[0]} constraint kernels, {state[1]} generation shapes, "
+            f"build key {state[2]}, shape set {state[3]}")  # fmt: skip
+
+
+def report(what: str, lines: int, runs: int, refused: list[str], quiet: bool = False) -> None:
+    log(f"kernels: {what}: {lines} lines, {runs} emitter runs, {len(refused)} refused")
+    for r in refused[: 5 if quiet else 50]:
+        log(f"  refused: {r}")
+    if len(refused) > (5 if quiet else 50):
+        log(f"  ... and {len(refused) - (5 if quiet else 50)} more refused")
+
+
+def prepare_kernels(plan: str, emit_txt: str, pins: str) -> None:
+    """commit's kernel store, emitted from the commitment sequence's witness before it is
+    deleted. (a) The kernels a reply's own emission would ask for (sequence-job.sh step 5 on
+    this plan). (b) Data-dependent variants, with only arguments upstream's drivers and planner
+    pass: every other line of the plan (plan.py keys a line by its prefix, table width, head,
+    flags and the attention output's form, not its limb widths, so a segment whose limbs differ
+    from its key's first line is emitted only here), then the two pins sequence-job.sh passes,
+    `--ao-rem-bits` and `--fold-rem-bits`, widened step by step above the pin each line is
+    emitted at up to the widest value the prover admits. README.md §Kernels says what is left
+    to a reply's own emission."""
+    host(GEN).mkdir(parents=True, exist_ok=True)
+    reps = emit_lines(plan, emit_txt)
+    runs, refused = emit(reps, pins, [])
+    report("commitment plan, the lines a reply emits", len(reps), runs, refused)
+    log(f"kernels: store after (a): {store_line(store())}")
+    known = set(reps)
+    rest = [a for a in plan_lines(plan) if a not in known]
+    runs, refused = emit(rest, pins, [])
+    report("commitment plan, every other line", len(rest), runs, refused)
+    for flag, cap in (("--ao-rem-bits", AO_REM_CAP), ("--fold-rem-bits", FOLD_REM_CAP)):
+        owns = [v for a in reps if (v := pinned([*pins.split(), *a], flag)) is not None]
+        start = min(owns, default=cap) + 1
+        runs, refused = 0, []
+        for value in range(start, cap + 1):
+            r, f = emit(reps, pins, [], sweep=(flag, value))
+            runs, refused = runs + r, refused + f
+        values = f"{start}..{cap}" if start <= cap else "none above the pins"
+        report(f"{flag} {values} on the lines a reply emits", len(reps), runs, refused,
+               quiet=True)  # fmt: skip
+    c, g, digest, shapes = store()
+    if not c or not g:
+        raise SystemExit(f"sash: the kernel store holds {c} constraint kernels and {g} "
+                         "generation shapes; every emission was refused (see the lines above)")
+    log(f"kernels: store after commit: {store_line((c, g, digest, shapes))}")
+
+
+def ensure_built() -> tuple[bool, float]:
+    """Install the store and rebuild the CUDA backend unless the binary was built from a store
+    of this same content (the digest is keyed on no path). Returns whether a build ran and its
+    seconds."""
+    state = store()
+    marker = host(BUILD + "/kernels.done")
+    if marker.is_file() and marker.read_text() == state[2] and host(CUDA).is_file():
+        log(f"kernels: build skipped, the installed store is this one ({state[2]})")
+        return False, 0.0
+    log(f"kernels: build: installing {store_line(state)}")
+    started = time.monotonic()
+    build()
+    marker.write_text(state[2])
+    seconds = time.monotonic() - started
+    log(f"kernels: build ran in {seconds:.1f} s; installed {state[2]}")
+    return True, seconds
+
+
+def build() -> None:
+    """sequence-job.sh step 5 and tools/gate/on-card.sh: install the store into a copy of the
+    vendored library, rebuild the CUDA backend and check that the library carries this card's
+    architecture."""
+    gen, src = GEN, BUILD + "/src"
     host(src).mkdir(parents=True, exist_ok=True)
     run(["cp", "-a", *(f"{SRC}/{p}" for p in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml",
                                               "prover", "nitroo")), src])  # fmt: skip
@@ -354,7 +521,6 @@ def kernels(plan: str, emit: str, pins: str, flags: list[str]) -> None:
     elf = run(["cuobjdump", "--list-elf", lib]).stdout
     if f"sm_{arch}" not in elf:  # the CMake fallback trap (tools/gate/README.md)
         raise SystemExit(f"sash: {lib} carries no sm_{arch} code; refusing to prove")
-    marker.write_text(key)
 
 
 def fold_binding(slices: list[dict]) -> dict:
@@ -376,6 +542,25 @@ def fold_binding(slices: list[dict]) -> dict:
                 edges[name] = e["state"]
     return {"edges": edges, "all_bound": all(v == "bound" for v in edges.values()),
             "unsound_skips": sorted(skips)}  # fmt: skip
+
+
+def reply_kernels(name: str, plan: str, emit_txt: str, pins: str,
+                  flags: list[str]) -> dict[str, float]:  # fmt: skip
+    """sequence-job.sh step 5 for one reply into the session's store, and a rebuild only when
+    that changed the store. Returns the two phases' seconds; `kernels_build` is 0 when no build
+    ran."""
+    t = time.monotonic()
+    before = store()
+    lines = emit_lines(plan, emit_txt)
+    runs, refused = emit(lines, pins, flags)
+    after = store()
+    seconds = time.monotonic() - t
+    report(f"{name}, the reply's own emission", len(lines), runs, refused)
+    log(f"kernels: {name}: the emission added {after[0] - before[0]} constraint kernels and "
+        f"{after[1] - before[1]} generation shapes; store {store_line(after)}")
+    built, build_seconds = ensure_built()
+    log(f"kernels: {name}: build {'ran' if built else 'skipped'}")
+    return {"kernels_emit": seconds, "kernels_build": build_seconds}
 
 
 def prove(job: dict) -> dict:
@@ -407,14 +592,12 @@ def prove(job: dict) -> dict:
             cwd=HSRC, env=env)  # fmt: skip
         run([*UV, "-m", "harness.witness.shift_ids", "--ids", f"{wit}/ids_long.npy", "--prefix",
              str(p), "--new", str(s), "--out", f"{wit}/ids.npy"], cwd=HSRC, env=env)  # fmt: skip
-        phases["ids"] = phases.get("ids", 0.0) + time.monotonic() - t
+        one = {"ids": time.monotonic() - t}  # this reply's own phases, logged below
         t = time.monotonic()
         extra = ["--ids", f"{wit}/ids.npy", "--attn-ranges", ZK_OUT + "/attn_ranges.json"]
-        plan, emit, pins = witness_and_plan(g, wit, extra)
-        phases["witness"] = phases.get("witness", 0.0) + time.monotonic() - t
-        t = time.monotonic()
-        kernels(plan, emit, pins, flags)
-        phases["kernels"] = phases.get("kernels", 0.0) + time.monotonic() - t
+        plan, emit_txt, pins = witness_and_plan(g, wit, extra)
+        one["witness"] = time.monotonic() - t
+        one.update(reply_kernels(f"req-{i}", plan, emit_txt, pins, flags))
         t = time.monotonic()
         proof_id = f"req-{i}"
         tmp = f"/io/proofs/.tmp-{proof_id}"
@@ -424,7 +607,7 @@ def prove(job: dict) -> dict:
             hi, tag = min(lo + SLICE, n), f"{out}/req{i}_slice_{lo:04d}.json"
             r = run([CUDA, "compose-chunks", *SHARED.split(), *pins.split(), *flags, "--plan", plan,
                      "--plan-slice", f"{lo}:{hi}", "--ser-dir", tmp], out=tag,
-                    env={"ZK_PIPELINE": "1", "ZK_KERNEL_STORE": BUILD + "/gen",
+                    env={"ZK_PIPELINE": "1", "ZK_KERNEL_STORE": GEN,
                          "RAYON_NUM_THREADS": str(min(16, cpus))})  # fmt: skip
             if "kernel fallback:" in r.stderr:  # never a silent host fallback
                 raise SystemExit(f"sash: slice {lo}:{hi} evaluated a lookup on the host")
@@ -433,7 +616,10 @@ def prove(job: dict) -> dict:
         last = json.loads((host(tmp) / f"B{nb - 1}L0.fixed.json").read_text())
         claimed = [int(x) for x in last["tok_in"]]
         os.rename(host(tmp), proofs_dir / proof_id)  # atomic release (RFC-0005)
-        phases["prove"] = phases.get("prove", 0.0) + time.monotonic() - t
+        one["prove"] = time.monotonic() - t
+        log(f"req-{i}: seconds " + ", ".join(f"{k} {v:.1f}" for k, v in one.items()))
+        for name, seconds in one.items():
+            phases[name] = phases.get(name, 0.0) + seconds
         parts = sorted(f.name for f in (proofs_dir / proof_id).iterdir())
         proofs.append({"proof_id": proof_id, "request_index": i, "claimed_output": claimed,
                        "parts": parts})  # fmt: skip

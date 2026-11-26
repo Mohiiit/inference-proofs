@@ -166,18 +166,22 @@ def harness(argv: list[str]) -> int:
         for name in ("tokens.npz", "attn_ranges.json"):
             (host(os.environ["ZK_OUT"]) / name).touch()
     elif mod == "harness.witness.shapes" and "--merge" in argv:
-        worst = {"kmax": 19, "ao_rem_bits": 20, "fold_rem_bits": 15, "fold_alpha": 6}
+        ao = int(os.environ.get("IPROOFS_SASH_STUB_AO", "20"))
+        worst = {"kmax": 19, "ao_rem_bits": ao, "fold_rem_bits": 15, "fold_alpha": 6}
         host(opt(argv, "--out")).write_text(json.dumps({"worst": worst}))
     elif mod == "harness.witness.plan":
         nb, hb = int(opt(argv, "--blocks")), opt(argv, "--head-blocks").split(",")
         last = int(opt(argv, "--layers").split("-")[1])
-        lines = [f"--table-bits 24 --witness w --ser-tag B{b}L{k}"
+        wit = opt(argv, "--dir")  # each sequence's own witness directory, as plan.py writes it
+        lines = [f"--table-bits 24 --witness {wit}/witness_B{b}_L{k} --ser-tag B{b}L{k}"
                  for b in range(nb) for k in range(last + 1)]  # fmt: skip
-        lines += [f"--table-bits 25 --witness h --ser-tag B{b}head" for b in hb]
+        hf = next(a.removeprefix("--head-flags=") for a in argv if a.startswith("--head-flags="))
+        lines += [f"--table-bits 25 --witness {wit}/head_B{b} {hf} --ser-tag B{b}head"
+                  for b in hb]  # fmt: skip
         host(opt(argv, "--out")).write_text("# stub plan\n" + "\n".join(lines) + "\n")
         host(opt(argv, "--emit-out")).write_text(lines[0] + "\n")
     elif "-c" in argv and "worst_of" in argv[argv.index("-c") + 1]:
-        print("--ao-rem-bits 20")
+        print(f"--ao-rem-bits {os.environ.get('IPROOFS_SASH_STUB_HEAD_AO', '20')}")
     return 0
 
 
@@ -208,7 +212,51 @@ def compose_chunks(argv: list[str]) -> int:
     return 0
 
 
+def emit(argv: list[str]) -> int:
+    """`cudaemit` and `genemit` into the store `--out` names, as cudagen.rs keeps it: a shape
+    list carried forward and extended by the shapes not in it yet, rewritten byte for byte when
+    nothing is new, and a manifest that also names the last run's source and its new count. A
+    shape here is a digest of the arguments with the witness path left out, so a line emitted
+    again for another sequence adds nothing; IPROOFS_SASH_STUB_NEW names one more shape every
+    emission asks for. A dump whose directory is gone is refused, as the prover refuses it.
+    IPROOFS_SASH_STUB_EMIT_REFUSE lists, comma-separated, `cudaemit` or `genemit` (every run of
+    it refused) or `<flag>=<min>` (both refused where the pin they read is at least `min`)."""
+    if "--witness" in argv and not host(opt(argv, "--witness")).parent.is_dir():
+        print(f"error: no dump at {opt(argv, '--witness')} (stub)", file=sys.stderr)
+        return 1
+    for rule in filter(None, os.environ.get("IPROOFS_SASH_STUB_EMIT_REFUSE", "").split(",")):
+        flag, _, least = rule.partition("=")
+        at = [i for i, a in enumerate(argv[:-1]) if a == flag]
+        if rule == argv[1] or (least and at and int(argv[at[-1] + 1]) >= int(least)):
+            print(f"thread 'main' panicked: {rule}: the lowering is refused (stub)",
+                  file=sys.stderr)  # fmt: skip
+            return 1
+    out, gen = host(opt(argv, "--out")), argv[1] == "genemit"
+    out.mkdir(parents=True, exist_ok=True)
+    store, manifest = (("gen_shapes.json", "gen_manifest.json") if gen
+                       else ("shapes.json", "manifest.json"))  # fmt: skip
+    # (family, first-seen name, Ir), as cudagen.rs writes the two lists
+    shapes = json.loads((out / store).read_text()) if (out / store).is_file() else []
+    have = [ir["fp"] for _, _, ir in shapes]
+    keep = [a for i, a in enumerate(argv[2:], 2) if argv[i - 1] not in ("--witness", "--out")
+            and a not in ("--witness", "--out")]  # fmt: skip
+    want = [hashlib.sha256(" ".join(keep).encode()).hexdigest()[:8]]
+    if os.environ.get("IPROOFS_SASH_STUB_NEW"):
+        want.append(os.environ["IPROOFS_SASH_STUB_NEW"])
+    new = [w for w in dict.fromkeys(want) if w not in have]
+    shapes += [["zk_stub", argv[1], {"fp": w}] for w in new]
+    (out / store).write_text(json.dumps(shapes))
+    (out / ("gen_zk_stub.cu" if gen else "evaluate_zk_stub.cu")).write_text("\n".join(have + new))
+    families = [{"family": "zk_stub", "shapes": len(shapes)}]
+    source = opt(argv, "--witness") if "--witness" in argv else "synthetic"
+    (out / manifest).write_text(json.dumps({"source": source, "families": families,
+                                            "kernels_new_this_run": len(new)}))  # fmt: skip
+    return 0
+
+
 def prover(argv: list[str]) -> int:
+    if argv[1] in ("cudaemit", "genemit"):
+        return emit(argv)
     if argv[1] == "model-roots":
         roots = [{"layer": 0, "c": 0, "model_root": "ab"}]
         host(opt(argv, "--out")).write_text(json.dumps(roots))
@@ -224,6 +272,9 @@ def cargo(argv: list[str]) -> int:
     lib = host(os.environ["CARGO_TARGET_DIR"]) / "release/build/stwo-0/out/libstwo_cuda.a"
     lib.parent.mkdir(parents=True, exist_ok=True)
     lib.write_bytes(b"")
+    (lib.parents[3] / "zk-prover").write_bytes(b"")  # release/zk-prover, the CUDA backend
+    with host("/io/stub-cargo.jsonl").open("a") as f:  # what the build ran beside
+        f.write(json.dumps({"commit_witness": host("/io/state/commit-witness").exists()}) + "\n")
     return 0
 
 

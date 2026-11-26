@@ -80,6 +80,12 @@
 #                         IPROOFS_DEV_IMAGE --keep-io` (recorded as local/<that image>,
 #                         digest_kind config; the io directory, with the engine's raw responses,
 #                         stays in the run directory and is uploaded if it holds no weights)
+#   IPROOFS_IMAGE         a development run from an adapter image other than system.yaml's pin
+#                         (a scoring image, Dockerfile.score: the pinned image with this
+#                         commit's adapter file), <repository>@sha256:<digest>, the image the
+#                         job was started from: the runs pass `--image IPROOFS_IMAGE`, so the
+#                         record names it (local/<that image>, digest_kind config); refused
+#                         unless the image's IPROOFS_ADAPTER_COMMIT is IPROOFS_COMMIT
 #   IPROOFS_FIDELITY_SLOTS  fidelity only: llama-server slots, the prompts sent at once (default
 #                         1); each control's replies are made the way the reference's are, and
 #                         the reference rerun (FI-2) shows what batching changes
@@ -1003,6 +1009,13 @@ if [ -n "${IPROOFS_DEV_IMAGE:-}" ]; then
     exit 3
   fi
   image_args=(--image "$IPROOFS_DEV_IMAGE" --keep-io)
+elif [ -n "${IPROOFS_IMAGE:-}" ]; then
+  log "runs name the image this job was started from, $IPROOFS_IMAGE, not system.yaml's pin"
+  if [ "${IPROOFS_ADAPTER_COMMIT:-}" != "$IPROOFS_COMMIT" ]; then
+    log "the image's adapter commit ${IPROOFS_ADAPTER_COMMIT:-unset} is not IPROOFS_COMMIT; stopping before any weights"
+    exit 3
+  fi
+  image_args=(--image "$IPROOFS_IMAGE")
 fi
 failed=0
 FETCHED=" "   # serving records fetched and checked by an earlier step of this job
