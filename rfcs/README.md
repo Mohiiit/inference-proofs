@@ -22,5 +22,6 @@ Methodology decisions (what the benchmark measures, how it runs, and how results
 | [0016](0016-glyph-properties-and-states.md) | Glyph properties and states (no longer drives the site from Level 1, RFC-0018) |
 | [0017](0017-requests-tasks-and-tested-states.md) | Requests, tasks and tested states (Part B replaced by RFC-0018) |
 | [0018](0018-level-1-ladder.md) | Level 1: the ladder, six checks, cost and fidelity |
+| [0019](0019-attested-rows.md) | Attested rows (draft) |
 
 To propose a new RFC, copy [0000-template.md](0000-template.md) to the next available number and fill in the relevant sections.
